@@ -253,26 +253,50 @@ async function runAllTestCases() {
   isRunningAll.value = true
   activeTab.value = 'testcases'
 
-  // Mark all as running
+  // Initialise every case as pending — only the case currently executing will flip to 'running'.
+  // Cases that never get a turn (because an earlier one failed) remain 'pending' in the UI.
   props.testCases.forEach((tc) => {
     results.value[tc.id] = {
-      status: 'running',
+      status: 'pending',
       actualOutput: '',
       error: '',
       executionTime: null
     }
   })
 
-  // Run test cases sequentially to prevent rate limits and give smooth feedback
+  // ── Fail-fast sequential runner ────────────────────────────────────────────
+  // We intentionally stop after the first failure to avoid burning limited
+  // compiler API credits on cases that can't possibly all pass anyway.
+  // Order: Visible Case 1 → Visible Case 2 → Hidden Case 1 → Hidden Case 2 → …
+  // ──────────────────────────────────────────────────────────────────────────
   for (const tc of props.testCases) {
+    // Mark the current case as running so the UI shows a live spinner
+    results.value[tc.id] = {
+      status: 'running',
+      actualOutput: '',
+      error: '',
+      executionTime: null
+    }
+
     await runSingleTestCase(tc, false)
+
+    // After awaiting, check whether this case passed.
+    // If it didn't, stop immediately — leave all remaining cases as 'pending'.
+    const outcome = results.value[tc.id]?.status
+    if (outcome === 'failed' || outcome === 'error') {
+      break
+    }
   }
 
   isRunningAll.value = false
 
-  // Trigger Toast Notification on top-right
+  // Only count cases that actually executed (i.e. not still 'pending').
+  const executedCases = props.testCases.filter(
+    (tc) => results.value[tc.id]?.status !== 'pending'
+  )
+  const executedCount = executedCases.length
+  const passedCount = executedCases.filter((tc) => results.value[tc.id]?.status === 'passed').length
   const totalCount = props.testCases.length
-  const passedCount = props.testCases.filter((tc) => results.value[tc.id]?.status === 'passed').length
 
   if (passedCount === totalCount) {
     showToast({
@@ -282,10 +306,13 @@ async function runAllTestCases() {
       duration: 3000
     })
   } else {
+    const failedCount = executedCount - passedCount
+    const skippedCount = totalCount - executedCount
+    const skippedMsg = skippedCount > 0 ? ` (${skippedCount} not run)` : ''
     showToast({
       type: 'error',
       title: `${passedCount}/${totalCount} Test Cases Passed`,
-      message: `${totalCount - passedCount} test case(s) failed. Check details below.`,
+      message: `${failedCount} test case(s) failed.${skippedMsg} Check details below.`,
       duration: 3000
     })
   }
@@ -329,25 +356,30 @@ async function copyInput(text, id) {
   } catch (e) {}
 }
 
-// Computed stats
+// Computed stats — 'pending' cases (skipped due to fail-fast) are excluded from counts
 const stats = computed(() => {
   const total = props.testCases.length
   let passed = 0
   let failed = 0
   let running = 0
+  let pending = 0
   let hasRun = false
 
   props.testCases.forEach((tc) => {
     const r = results.value[tc.id]
     if (r) {
-      hasRun = true
-      if (r.status === 'passed') passed++
-      else if (r.status === 'failed' || r.status === 'error') failed++
-      else if (r.status === 'running') running++
+      if (r.status === 'pending') {
+        pending++
+      } else {
+        hasRun = true
+        if (r.status === 'passed') passed++
+        else if (r.status === 'failed' || r.status === 'error') failed++
+        else if (r.status === 'running') running++
+      }
     }
   })
 
-  return { total, passed, failed, running, hasRun }
+  return { total, passed, failed, running, pending, hasRun }
 })
 
 // Current selected test case object
