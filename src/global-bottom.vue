@@ -3,6 +3,7 @@ import { computed, ref, onMounted, onUnmounted } from 'vue'
 import { useNav, useSlideContext } from '@slidev/client'
 import LoginOverlay from './components/LoginOverlay.vue'
 import { authState, logout } from './auth'
+import { isAdmin } from './roles'
 
 const { currentPage, total, currentSlideRoute, go } = useNav()
 const { $frontmatter } = useSlideContext()

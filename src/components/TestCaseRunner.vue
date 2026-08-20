@@ -28,7 +28,6 @@ const selectedTestCaseId = ref(props.testCases[0]?.id || 1)
 // Test case execution results map: id -> { status, actualOutput, stderr, error, executionTime }
 // status: 'idle' | 'running' | 'passed' | 'failed' | 'error'
 const results = ref({})
-const isRunningAll = ref(false)
 const copiedId = ref(null)
 
 // Custom input runner state
@@ -155,23 +154,35 @@ function removeToast(id) {
   }
 }
 
-// Run single test case
-async function runSingleTestCase(tc, fromSingleButton = false) {
+// State tracking for execution
+const isRunningVisible = ref(false)
+const isRunningAll = ref(false)
+const lastTestedCode = ref('')
+
+// Invalidate tested code when editor code changes
+watch(
+  () => props.code,
+  (newCode, oldCode) => {
+    if (newCode !== oldCode) {
+      lastTestedCode.value = ''
+    }
+  }
+)
+
+/**
+ * Execute a single test case without throwing, updating reactive state.
+ */
+async function runSingleTestCase(tc) {
   const codeToRun = getEffectiveCode()
   if (!codeToRun || !codeToRun.trim()) {
     results.value[tc.id] = {
       status: 'error',
-      error: 'Please write code in the editor before running test cases.'
+      actualOutput: '',
+      error: 'Please write code in the editor before running test cases.',
+      executionTime: null
     }
-    if (fromSingleButton) {
-      showToast({
-        type: 'error',
-        title: `${tc.name || 'Test Case'} Failed`,
-        message: 'No code in editor to execute.',
-        duration: 3000
-      })
-    }
-    return
+    emit('update:results', results.value)
+    return { passed: false, error: 'No code in editor' }
   }
 
   results.value[tc.id] = {
@@ -180,6 +191,7 @@ async function runSingleTestCase(tc, fromSingleButton = false) {
     error: '',
     executionTime: null
   }
+  emit('update:results', results.value)
 
   try {
     const res = await executeCode(codeToRun, tc.input, props.language)
@@ -194,14 +206,8 @@ async function runSingleTestCase(tc, fromSingleButton = false) {
         error: res.exception || res.stderr || 'Runtime error',
         executionTime: res.executionTime
       }
-      if (fromSingleButton) {
-        showToast({
-          type: 'error',
-          title: `${tc.name || 'Test Case'} Error`,
-          message: res.exception || res.stderr || 'Runtime error',
-          duration: 3000
-        })
-      }
+      emit('update:results', results.value)
+      return { passed: false, error: res.exception || res.stderr || 'Runtime error' }
     } else {
       const isPassed = normActual === normExpected
       results.value[tc.id] = {
@@ -210,34 +216,89 @@ async function runSingleTestCase(tc, fromSingleButton = false) {
         error: res.stderr || '',
         executionTime: res.executionTime
       }
-      if (fromSingleButton) {
-        showToast({
-          type: isPassed ? 'success' : 'error',
-          title: isPassed ? `${tc.name || 'Test Case'} Passed` : `${tc.name || 'Test Case'} Failed`,
-          message: isPassed ? 'Output matched expected result.' : 'Output did not match expected result.',
-          duration: 3000
-        })
-      }
+      emit('update:results', results.value)
+      return { passed: isPassed }
     }
   } catch (err) {
     results.value[tc.id] = {
       status: 'error',
-      error: err.message || 'Execution failed'
+      actualOutput: '',
+      error: err.message || 'Execution failed',
+      executionTime: null
     }
-    if (fromSingleButton) {
-      showToast({
-        type: 'error',
-        title: `${tc.name || 'Test Case'} Error`,
-        message: err.message || 'Execution failed',
-        duration: 3000
-      })
+    emit('update:results', results.value)
+    return { passed: false, error: err.message || 'Execution failed' }
+  }
+}
+
+/**
+ * 1. "Run Case" Button: Sequentially runs all visible (non-hidden) test cases.
+ * If first case fails, stops immediately and does not run subsequent cases.
+ */
+async function runVisibleTestCases() {
+  const codeToRun = getEffectiveCode()
+  if (!codeToRun || !codeToRun.trim()) {
+    showToast({
+      type: 'error',
+      title: 'No Code to Run',
+      message: 'Please write code in the editor before running test cases.',
+      duration: 3000
+    })
+    return
+  }
+
+  // Clear previous results if code changed
+  if (lastTestedCode.value !== codeToRun) {
+    results.value = {}
+    lastTestedCode.value = codeToRun
+  }
+
+  const visibleCases = props.testCases.filter((tc) => !tc.isHidden)
+  const targetCases = visibleCases.length > 0 ? visibleCases : props.testCases
+
+  isRunningVisible.value = true
+  activeTab.value = 'testcases'
+
+  let allPassed = true
+  let passedCount = 0
+
+  for (const tc of targetCases) {
+    selectedTestCaseId.value = tc.id
+    const res = await runSingleTestCase(tc)
+
+    if (res.passed) {
+      passedCount++
+    } else {
+      allPassed = false
+      // Fail-fast: Stop execution immediately on first visible case failure!
+      break
     }
   }
 
-  emit('update:results', results.value)
+  isRunningVisible.value = false
+
+  if (allPassed) {
+    showToast({
+      type: 'success',
+      title: 'Visible Test Cases Passed!',
+      message: `All ${passedCount} visible test cases passed. Click "Submit" to evaluate hidden cases.`,
+      duration: 3000
+    })
+  } else {
+    showToast({
+      type: 'error',
+      title: 'Test Case Failed',
+      message: `Execution stopped. Please fix errors in ${currentTestCase.value?.name || 'test case'}.`,
+      duration: 3500
+    })
+  }
 }
 
-// Run all test cases in batch
+/**
+ * 2. "Submit" Button: Evaluates the remaining hidden test cases (or all cases if not yet run).
+ * Skips test cases that were already verified and passed on this code.
+ * Stops immediately on first failure.
+ */
 async function runAllTestCases() {
   const codeToRun = getEffectiveCode()
   if (!codeToRun || !codeToRun.trim()) {
@@ -250,70 +311,51 @@ async function runAllTestCases() {
     return
   }
 
+  // Clear previous results if code changed
+  if (lastTestedCode.value !== codeToRun) {
+    results.value = {}
+    lastTestedCode.value = codeToRun
+  }
+
   isRunningAll.value = true
   activeTab.value = 'testcases'
 
-  // Initialise every case as pending — only the case currently executing will flip to 'running'.
-  // Cases that never get a turn (because an earlier one failed) remain 'pending' in the UI.
-  props.testCases.forEach((tc) => {
-    results.value[tc.id] = {
-      status: 'pending',
-      actualOutput: '',
-      error: '',
-      executionTime: null
-    }
-  })
+  let allPassed = true
 
-  // ── Fail-fast sequential runner ────────────────────────────────────────────
-  // We intentionally stop after the first failure to avoid burning limited
-  // compiler API credits on cases that can't possibly all pass anyway.
-  // Order: Visible Case 1 → Visible Case 2 → Hidden Case 1 → Hidden Case 2 → …
-  // ──────────────────────────────────────────────────────────────────────────
   for (const tc of props.testCases) {
-    // Mark the current case as running so the UI shows a live spinner
-    results.value[tc.id] = {
-      status: 'running',
-      actualOutput: '',
-      error: '',
-      executionTime: null
+    // If this case was already checked and passed on the current code, skip it!
+    if (results.value[tc.id]?.status === 'passed') {
+      continue
     }
 
-    await runSingleTestCase(tc, false)
+    selectedTestCaseId.value = tc.id
+    const res = await runSingleTestCase(tc)
 
-    // After awaiting, check whether this case passed.
-    // If it didn't, stop immediately — leave all remaining cases as 'pending'.
-    const outcome = results.value[tc.id]?.status
-    if (outcome === 'failed' || outcome === 'error') {
+    if (!res.passed) {
+      allPassed = false
+      // Fail-fast: Stop immediately on failure
       break
     }
   }
 
   isRunningAll.value = false
 
-  // Only count cases that actually executed (i.e. not still 'pending').
-  const executedCases = props.testCases.filter(
-    (tc) => results.value[tc.id]?.status !== 'pending'
-  )
-  const executedCount = executedCases.length
-  const passedCount = executedCases.filter((tc) => results.value[tc.id]?.status === 'passed').length
   const totalCount = props.testCases.length
+  const passedCount = props.testCases.filter((tc) => results.value[tc.id]?.status === 'passed').length
 
-  if (passedCount === totalCount) {
+  if (allPassed && passedCount === totalCount) {
     showToast({
       type: 'success',
       title: 'All Test Cases Passed!',
-      message: `${passedCount}/${totalCount} test cases passed successfully.`,
-      duration: 3000
+      message: `🎉 All ${totalCount} test cases verified successfully.`,
+      duration: 3500
     })
   } else {
-    const failedCount = executedCount - passedCount
-    const skippedCount = totalCount - executedCount
-    const skippedMsg = skippedCount > 0 ? ` (${skippedCount} not run)` : ''
     showToast({
       type: 'error',
-      title: `${passedCount}/${totalCount} Test Cases Passed`,
-      message: `${failedCount} test case(s) failed.${skippedMsg} Check details below.`,
-      duration: 3000
+      title: 'Submission Incomplete',
+      message: `${passedCount}/${totalCount} test cases passed. Fix errors to complete.`,
+      duration: 3500
     })
   }
 }
@@ -400,48 +442,13 @@ watch(
 
 defineExpose({
   runAllTestCases,
+  runVisibleTestCases,
   runSingleTestCase
 })
 </script>
 
 <template>
   <div class="tc-container">
-    <!-- ── Top Action & Summary Bar ──────────────────────────────────────── -->
-    <div class="tc-top-bar">
-      <div class="tc-sub-tabs">
-        <button
-          class="tc-sub-tab"
-          :class="{ 'tc-sub-tab--active': activeTab === 'testcases' }"
-          @click="activeTab = 'testcases'"
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="tc-tab-icon">
-            <path d="M9 11l3 3L22 4" />
-            <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
-          </svg>
-          Test Cases
-          <span class="tc-count-badge">{{ props.testCases.length }}</span>
-        </button>
-      </div>
-
-      <div class="tc-actions">
-        <!-- Live Run All Button -->
-        <button
-          v-if="activeTab === 'testcases'"
-          class="tc-run-all-btn"
-          :class="{ 'tc-run-all-btn--running': isRunningAll }"
-          :disabled="isRunningAll"
-          @click="runAllTestCases"
-          title="Run code against all test cases"
-        >
-          <svg v-if="!isRunningAll" viewBox="0 0 24 24" fill="currentColor" class="tc-play-icon">
-            <polygon points="5 3 19 12 5 21 5 3" />
-          </svg>
-          <span v-else class="tc-spinner"></span>
-          {{ isRunningAll ? 'Testing...' : 'Run Tests' }}
-        </button>
-      </div>
-    </div>
-
     <!-- ── Tab 1: Test Cases View ────────────────────────────────────────── -->
     <div v-if="activeTab === 'testcases'" class="tc-body">
       <!-- Test Cases Horizontal Selector / Chips -->
@@ -465,7 +472,6 @@ defineExpose({
             <span v-else class="tc-chip-dot"></span>
           </span>
           <span class="tc-chip-label">{{ tc.name || `Case ${idx + 1}` }}</span>
-          <!-- <span v-if="tc.isHidden" class="tc-hidden-icon" title="Hidden Test Case">🔒</span> -->
         </button>
       </div>
 
@@ -474,21 +480,34 @@ defineExpose({
         <div class="tc-detail-header">
           <div class="tc-detail-title">
             <span class="tc-case-badge">{{ currentTestCase.name || `Test Case ${currentTestCase.id}` }}</span>
-            <!-- <span v-if="currentTestCase.isHidden" class="tc-badge-hidden">Hidden Case</span> -->
             <span v-if="results[currentTestCase.id]?.executionTime !== null && results[currentTestCase.id]?.executionTime !== undefined" class="tc-time-badge">
               ⚡ {{ results[currentTestCase.id].executionTime }}ms
             </span>
           </div>
 
-          <button
-            class="tc-run-single-btn"
-            :disabled="results[currentTestCase.id]?.status === 'running'"
-            @click="runSingleTestCase(currentTestCase)"
-            title="Run only this test case"
-          >
-            <span v-if="results[currentTestCase.id]?.status === 'running'" class="tc-spinner-xs"></span>
-            <span v-else>▶ Run Case</span>
-          </button>
+          <div class="tc-detail-actions">
+            <button
+              class="tc-run-single-btn"
+              :class="{ 'tc-run-single-btn--running': isRunningVisible }"
+              :disabled="isRunningVisible || isRunningAll"
+              @click="runVisibleTestCases"
+              title="Run visible test cases sequentially"
+            >
+              <span v-if="isRunningVisible" class="tc-spinner-xs"></span>
+              <span v-else>▶ Run</span>
+            </button>
+
+            <button
+              class="tc-run-single-btn tc-save-btn"
+              :class="{ 'tc-run-single-btn--running': isRunningAll }"
+              :disabled="isRunningVisible || isRunningAll"
+              @click="runAllTestCases"
+              title="Submit solution (evaluates all test cases)"
+            >
+              <span v-if="isRunningAll" class="tc-spinner-xs"></span>
+              <span v-else>▶ Submit</span>
+            </button>
+          </div>
         </div>
 
         <!-- Hidden Test Case Display (Input and Expected Output always protected) -->
@@ -512,7 +531,7 @@ defineExpose({
               <span v-if="results[currentTestCase.id]?.status === 'passed'">Your program produced the correct output for this hidden test case.</span>
               <span v-else-if="results[currentTestCase.id]?.status === 'failed'">Your program did not produce the expected output for this hidden test case.</span>
               <span v-else-if="results[currentTestCase.id]?.status === 'error'">Runtime or compilation error occurred while executing this hidden case.</span>
-              <span v-else>Input and expected output are hidden for assessment. Click "Run Tests" to evaluate.</span>
+              <span v-else>Input and expected output are hidden for assessment. Click "Submit" to evaluate.</span>
             </div>
 
             <!-- Error details if compilation error -->
@@ -659,7 +678,7 @@ defineExpose({
 .tc-top-bar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   padding: 6px 10px;
   background: #f8fafc;
   border-bottom: 1px solid #e2e8f0;
@@ -991,6 +1010,12 @@ defineExpose({
   margin-bottom: 2px;
 }
 
+.tc-detail-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .tc-detail-title {
   display: flex;
   align-items: center;
@@ -1034,6 +1059,19 @@ defineExpose({
 .tc-run-single-btn:hover:not(:disabled) {
   background: #e2e8f0;
   color: #0f172a;
+}
+
+.tc-save-btn {
+  border-color: #ef5050;
+  background: #fff5f5;
+  color: #ef5050;
+  font-weight: 700;
+}
+
+.tc-save-btn:hover:not(:disabled) {
+  border-color: #dc2626;
+  background: #fee2e2;
+  color: #dc2626;
 }
 
 /* ── Block & Code Box ────────────────────────────────────────────────── */

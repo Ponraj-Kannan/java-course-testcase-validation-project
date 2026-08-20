@@ -9,9 +9,9 @@
   },
   "scripts": {
     "dev": "node scripts/slidev-deck.mjs dev",
-    "dev:01": "node scripts/slidev-deck.mjs dev src/root.md",
+    "dev:01": "node scripts/slidev-deck.mjs dev src/01-introduction-to-java.md",
     "build": "node scripts/slidev-deck.mjs build",
-    "build:01": "node scripts/slidev-deck.mjs build src/root.md",
+    "build:01": "node scripts/slidev-deck.mjs build src/01-introduction-to-java.md",
     "new:deck": "node scripts/create-slide-deck.mjs",
     "new:session": "node templates/generators/new-session.js",
     "template:generate": "node templates/generators/new-session.js",
@@ -43,7 +43,7 @@
   "dependencies": {
     "@slidev/cli": "latest",
     "@slidev/theme-default": "latest",
-    "firebase": "^12.13.0",
+    "@supabase/supabase-js": "^2.112.3",
     "monaco-editor": "^0.46.0",
     "vue": "^3.4.0"
   },

@@ -31,9 +31,9 @@ export default defineConfig(({ mode }) => {
     return { vercelReq, vercelRes }
   }
 
-  // Helper: parse POST/DELETE body from raw request
+  // Helper: parse POST/DELETE/PATCH body from raw request
   async function parseBody(req: any): Promise<any> {
-    if (req.method !== 'POST' && req.method !== 'DELETE') return {}
+    if (req.method !== 'POST' && req.method !== 'DELETE' && req.method !== 'PATCH') return {}
     return new Promise((resolve) => {
       let data = ''
       req.on('data', (chunk: any) => data += chunk)

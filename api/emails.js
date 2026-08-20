@@ -1,271 +1,244 @@
-import fs from 'node:fs'
-import path from 'node:path'
-import { initializeApp, getApps, getApp } from 'firebase/app'
-import { getFirestore, doc, getDoc, setDoc } from 'firebase/firestore'
+/**
+ * /api/emails (and /api/users)
+ *
+ * Vercel Serverless Function and Vite dev server handler for user and role management.
+ * Connected to Supabase PostgreSQL `users` table as the sole source of truth.
+ *
+ * Endpoints / Methods:
+ *   - POST (with action: 'verify') or POST with idToken:
+ *       Verifies Google ID Token or user email and returns user record + DB role from Supabase.
+ *   - GET:
+ *       Returns whitelisted emails and full user profiles with roles from Supabase.
+ *   - POST:
+ *       Admin-only. Inserts new user(s) with role ('admin', 'trainer', 'student') into Supabase.
+ *   - DELETE:
+ *       Admin-only. Removes user from Supabase.
+ *   - PATCH:
+ *       Admin-only. Updates a user's role in Supabase.
+ */
 
-// Your web app's Firebase configuration
-const firebaseConfig = {
-  apiKey: "AIzaSyDlvW1FFJg0aTYOPUcIrlYxU6L7B6kdwwU",
-  authDomain: "slidev-demo-course.firebaseapp.com",
-  projectId: "slidev-demo-course",
-  storageBucket: "slidev-demo-course.firebasestorage.app",
-  messagingSenderId: "339581398931",
-  appId: "1:339581398931:web:3b3a1b76a2d9e46e398266"
-};
+import {
+  findUserByEmail,
+  getAllUsers,
+  addUsers,
+  deleteUser,
+  updateUserRole,
+  verifyGoogleToken
+} from './_lib/supabase.js'
 
-// Initialize Firebase — guard against duplicate initialization in Vite dev HMR
-const firebaseApp = getApps().find(a => a.name === 'slidev-pro') ?? initializeApp(firebaseConfig, 'slidev-pro')
-const db = getFirestore(firebaseApp)
-
-// Admin emails — must be kept in sync with ADMIN_EMAILS in LoginOverlay.vue
-const ADMIN_EMAILS = [
-  'ponrajacc@gmail.com',
-  'gunatamil123@gmail.com',
-  'learning@faceprep.in'
-]
-
-// Global cache in case filesystem is read-only (e.g. on Vercel)
-let inMemoryList = null
-
-function getFilePath() {
-  return path.join(process.cwd(), 'allowed-emails.json')
-}
-
-async function loadEmails() {
-  console.log('--- loadEmails called ---')
-  // 1. Try to load from Firestore
-  try {
-    const docRef = doc(db, 'whitelist', 'emails')
-    const docSnap = await getDoc(docRef)
-    if (docSnap.exists()) {
-      const data = docSnap.data()
-      if (data && Array.isArray(data.list)) {
-        inMemoryList = data.list
-        return inMemoryList
-      }
-    }
-  } catch (error) {
-    console.warn('Firestore read failed (using local/in-memory fallback):', error.message || error)
-  }
-
-  // 2. Fallback to in-memory cache if Firestore read failed
-  if (inMemoryList) {
-    return inMemoryList
-  }
-
-  // 3. Fallback to local file allowed-emails.json
-  const filePath = getFilePath()
-  try {
-    if (fs.existsSync(filePath)) {
-      const data = fs.readFileSync(filePath, 'utf8')
-      inMemoryList = JSON.parse(data)
-      // Seed Firestore with local whitelist
-      try {
-        const docRef = doc(db, 'whitelist', 'emails')
-        await setDoc(docRef, { list: inMemoryList })
-      } catch (dbErr) {
-        console.warn('Failed to seed local emails to Firestore:', dbErr.message || dbErr)
-      }
-      return inMemoryList
-    }
-  } catch (error) {
-    console.error('Failed to read allowed-emails.json:', error)
-  }
-
-  // Fallback to default admin emails
-  inMemoryList = [...ADMIN_EMAILS]
-
-  try {
-    const docRef = doc(db, 'whitelist', 'emails')
-    await setDoc(docRef, { list: inMemoryList })
-  } catch (dbErr) {
-    console.warn('Failed to seed default email to Firestore:', dbErr.message || dbErr)
-  }
-  return inMemoryList
-}
-
-async function saveEmails(emails) {
-  inMemoryList = emails
-
-  // 1. Save to Firestore
-  let dbSuccess = false
-  try {
-    const docRef = doc(db, 'whitelist', 'emails')
-    await setDoc(docRef, { list: emails })
-    dbSuccess = true
-  } catch (error) {
-    console.warn('Failed to write to Firestore (saving locally instead):', error.message || error)
-  }
-
-  // 2. Save to local file allowed-emails.json (backup / local dev)
-  const filePath = getFilePath()
-  try {
-    fs.writeFileSync(filePath, JSON.stringify(emails, null, 2), 'utf8')
-    return { success: dbSuccess, readOnly: false }
-  } catch (error) {
-    console.warn('Failed to write allowed-emails.json (likely read-only serverless environment):', error.message || error)
-    return { success: dbSuccess, readOnly: true }
-  }
-}
-
-// Verifies Google ID Token via Google's tokeninfo API
-async function verifyGoogleToken(idToken) {
-  if (!idToken) return null
-
-  try {
-    const response = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`)
-    if (!response.ok) {
-      return null
-    }
-    const payload = await response.json()
-    // Verify client ID matches
-    const expectedClientId = '207254417956-cgi3av80ac090nqrurpjkdhj19nievvp.apps.googleusercontent.com'
-    if (payload.aud !== expectedClientId) {
-      console.warn('Token aud does not match client ID')
-      return null
-    }
-    return payload
-  } catch (error) {
-    console.error('Error verifying Google token:', error)
+/**
+ * Authenticates the requester from the Authorization Bearer header.
+ * Supports:
+ *   1. Google ID Token (verified via Google tokeninfo API)
+ *   2. Zoho verified token (zoho:<code> checked against active session/DB)
+ * Returns the requester's database record { id, email, role } or null.
+ */
+async function authenticateRequester(req) {
+  const authHeader = req.headers.authorization
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return null
   }
+
+  const token = authHeader.split(' ')[1]
+  if (!token) return null
+
+  // Check if it's a Zoho session token
+  if (token.startsWith('zoho:')) {
+    const rawEmail = req.headers['x-user-email'] || req.body?.requesterEmail
+    if (rawEmail) {
+      const user = await findUserByEmail(rawEmail)
+      return user
+    }
+  }
+
+  // Google ID Token verification
+  const googlePayload = await verifyGoogleToken(token)
+  if (googlePayload && googlePayload.email) {
+    const isVerified = googlePayload.email_verified === 'true' || googlePayload.email_verified === true
+    if (!isVerified) return null
+    return await findUserByEmail(googlePayload.email)
+  }
+
+  return null
 }
 
 export default async function handler(req, res) {
   // CORS configuration
   res.setHeader('Access-Control-Allow-Origin', '*')
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, PATCH, OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-user-email')
 
   if (req.method === 'OPTIONS') {
     return res.status(200).end()
   }
 
-  // Load emails
-  const emails = await loadEmails()
-
-  if (req.method === 'GET') {
-    return res.status(200).json({ emails })
-  }
-
-  if (req.method === 'POST' || req.method === 'DELETE') {
-    // 1. Verify Google Authorization header
-    const authHeader = req.headers.authorization
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Unauthorized: Missing or invalid token' })
-    }
-
-    const token = authHeader.split(' ')[1]
-    const tokenPayload = await verifyGoogleToken(token)
-
-    if (!tokenPayload) {
-      return res.status(401).json({ error: 'Unauthorized: Invalid token signature or expired' })
-    }
-
-    const requesterEmail = tokenPayload.email
-    const isRequesterVerified = tokenPayload.email_verified === 'true' || tokenPayload.email_verified === true
-
-    if (!isRequesterVerified) {
-      return res.status(403).json({ error: 'Forbidden: Google email is not verified' })
-    }
-
-    // 2. ONLY ponraij@gmail.com can manage the email whitelist
-    if (!ADMIN_EMAILS.includes(requesterEmail)) {
-      return res.status(403).json({ error: 'Forbidden: Only administrators can manage allowed emails' })
-    }
-
-    // 3. Process actions
-    if (req.method === 'POST') {
-      const { email, emails: emailsToAdd } = req.body
-
-      // Determine list of emails to add
-      let listToAdd = []
-      if (email && typeof email === 'string') {
-        listToAdd.push(email)
-      } else if (Array.isArray(emailsToAdd)) {
-        listToAdd = emailsToAdd
-      } else {
-        return res.status(400).json({ error: 'Bad Request: Missing email or emails field' })
+  try {
+    // ── 1. Google Token Verification Endpoint ─────────────────────────────────
+    if (req.method === 'POST' && (req.body?.action === 'verify' || req.body?.idToken)) {
+      const idToken = req.body.idToken || req.body.token
+      if (!idToken) {
+        return res.status(400).json({ error: 'Missing idToken for verification' })
       }
 
-      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
-      const validEmailsToAdd = []
-
-      for (let item of listToAdd) {
-        if (typeof item !== 'string') continue
-        const cleanEmail = item.trim().toLowerCase()
-        if (emailRegex.test(cleanEmail)) {
-          validEmailsToAdd.push(cleanEmail)
-        }
+      const googlePayload = await verifyGoogleToken(idToken)
+      if (!googlePayload || !googlePayload.email) {
+        return res.status(401).json({ error: 'Invalid Google identity token', allowed: false })
       }
 
-      if (validEmailsToAdd.length === 0) {
-        return res.status(400).json({ error: 'Bad Request: No valid email addresses provided' })
+      const email = googlePayload.email.toLowerCase().trim()
+      const dbUser = await findUserByEmail(email)
+
+      if (!dbUser) {
+        return res.status(403).json({
+          allowed: false,
+          error: `Email '${email}' is not registered. Please contact an administrator.`,
+          email
+        })
       }
-
-      // Add to existing list, avoiding duplicates
-      let updatedList = [...emails]
-      let addedCount = 0
-      for (const cleanEmail of validEmailsToAdd) {
-        if (!updatedList.includes(cleanEmail)) {
-          updatedList.push(cleanEmail)
-          addedCount++
-        }
-      }
-
-      const saveResult = await saveEmails(updatedList)
-
-      const isSaved = saveResult.success || !saveResult.readOnly
-      if (!isSaved) {
-        return res.status(500).json({ error: 'Database Write Error: Failed to save changes to Firestore database and local storage is read-only.' })
-      }
-
 
       return res.status(200).json({
-        emails: updatedList,
-        persisted: !saveResult.readOnly,
-        message: saveResult.readOnly
-          ? `Successfully whitelisted ${addedCount} email(s) in database (local filesystem read-only)`
-          : (!saveResult.success
-            ? `Successfully whitelisted ${addedCount} email(s) locally (Firestore write failed)`
-            : `Successfully whitelisted ${addedCount} email(s)`)
+        allowed: true,
+        user: {
+          id: dbUser.id,
+          email: dbUser.email,
+          role: dbUser.role,
+          name: googlePayload.name || '',
+          picture: googlePayload.picture || ''
+        }
       })
     }
 
+    // ── 2. GET Users / Allowed Emails ─────────────────────────────────────────
+    if (req.method === 'GET') {
+      const users = await getAllUsers()
+      const emails = users.map(u => u.email)
+      return res.status(200).json({
+        emails,
+        users
+      })
+    }
+
+    // ── 3. Authenticate Requester for Mutations (POST, DELETE, PATCH) ──────────
+    const requester = await authenticateRequester(req)
+
+    if (!requester) {
+      return res.status(401).json({
+        error: 'Unauthorized: Valid Google authentication token or active session required.'
+      })
+    }
+
+    // Role-based authorization: only admin role can perform mutations
+    if (requester.role !== 'admin') {
+      return res.status(403).json({
+        error: `Forbidden: Administrator role required. Current role: '${requester.role}'.`
+      })
+    }
+
+    // ── 4. POST: Add User(s) ──────────────────────────────────────────────────
+    if (req.method === 'POST') {
+      const { email, emails: emailsToAdd, users: usersToAdd, role = 'student' } = req.body || {}
+
+      let items = []
+      if (Array.isArray(usersToAdd)) {
+        items = usersToAdd
+      } else if (Array.isArray(emailsToAdd)) {
+        items = emailsToAdd.map(e => ({ email: e, role }))
+      } else if (email && typeof email === 'string') {
+        items = [{ email, role }]
+      } else {
+        return res.status(400).json({ error: 'Bad Request: Missing email, emails, or users field' })
+      }
+
+      const result = await addUsers(items)
+      const allUsers = result.users || await getAllUsers()
+
+      return res.status(200).json({
+        message: `Successfully added/updated ${result.count} user(s).`,
+        count: result.count,
+        users: allUsers,
+        emails: allUsers.map(u => u.email)
+      })
+    }
+
+    // ── 5. DELETE: Remove User ────────────────────────────────────────────────
     if (req.method === 'DELETE') {
-      const { email } = req.body
+      const { email } = req.body || {}
       if (!email || typeof email !== 'string') {
         return res.status(400).json({ error: 'Bad Request: Missing email field' })
       }
 
       const targetEmail = email.trim().toLowerCase()
-      if (ADMIN_EMAILS.includes(targetEmail)) {
-        return res.status(400).json({ error: 'Bad Request: Cannot delete the primary administrator email' })
+
+      // Prevent self-deletion
+      if (requester.email.toLowerCase() === targetEmail) {
+        return res.status(400).json({ error: 'Action not allowed: You cannot delete your own admin account.' })
       }
 
-      if (!emails.includes(targetEmail)) {
-        return res.status(404).json({ error: 'Not Found: Email not found in whitelist' })
+      // Check if target user exists
+      const targetUser = await findUserByEmail(targetEmail)
+      if (!targetUser) {
+        return res.status(404).json({ error: 'User not found' })
       }
 
-      const updatedList = emails.filter(e => e !== targetEmail)
-      const saveResult = await saveEmails(updatedList)
-
-      const isSaved = saveResult.success || !saveResult.readOnly
-      if (!isSaved) {
-        return res.status(500).json({ error: 'Database Write Error: Failed to save changes to Firestore database and local storage is read-only.' })
+      // Check if this is the last admin
+      if (targetUser.role === 'admin') {
+        const allUsers = await getAllUsers()
+        const adminCount = allUsers.filter(u => u.role === 'admin').length
+        if (adminCount <= 1) {
+          return res.status(400).json({ error: 'Action not allowed: Cannot delete the last remaining administrator.' })
+        }
       }
+
+      const result = await deleteUser(targetEmail)
+      const allUsers = result.users || await getAllUsers()
 
       return res.status(200).json({
-        emails: updatedList,
-        persisted: !saveResult.readOnly,
-        message: saveResult.readOnly
-          ? 'Email removed from database (local filesystem read-only)'
-          : (!saveResult.success
-            ? 'Email removed successfully locally (Firestore write failed)'
-            : 'Email removed successfully')
+        message: `User '${targetEmail}' removed successfully.`,
+        users: allUsers,
+        emails: allUsers.map(u => u.email)
       })
     }
-  }
 
-  return res.status(405).json({ error: 'Method not allowed' })
+    // ── 6. PATCH: Update User Role ────────────────────────────────────────────
+    if (req.method === 'PATCH') {
+      const { email, role } = req.body || {}
+      if (!email || !role) {
+        return res.status(400).json({ error: 'Bad Request: email and role are required' })
+      }
+
+      const validRoles = ['admin', 'trainer', 'student']
+      if (!validRoles.includes(role)) {
+        return res.status(400).json({ error: `Invalid role '${role}'. Must be one of: ${validRoles.join(', ')}` })
+      }
+
+      const targetEmail = email.trim().toLowerCase()
+      const targetUser = await findUserByEmail(targetEmail)
+      if (!targetUser) {
+        return res.status(404).json({ error: 'User not found' })
+      }
+
+      // Prevent demoting the last admin
+      if (targetUser.role === 'admin' && role !== 'admin') {
+        const allUsers = await getAllUsers()
+        const adminCount = allUsers.filter(u => u.role === 'admin').length
+        if (adminCount <= 1) {
+          return res.status(400).json({ error: 'Cannot demote the last remaining administrator.' })
+        }
+      }
+
+      await updateUserRole(targetEmail, role)
+      const allUsers = await getAllUsers()
+
+      return res.status(200).json({
+        message: `Updated role for '${targetEmail}' to '${role}'.`,
+        users: allUsers,
+        emails: allUsers.map(u => u.email)
+      })
+    }
+
+    return res.status(405).json({ error: 'Method not allowed' })
+  } catch (err) {
+    console.error('[api/emails] Handler error:', err)
+    return res.status(500).json({ error: err.message || 'Internal server error' })
+  }
 }

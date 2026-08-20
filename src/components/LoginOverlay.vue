@@ -1,12 +1,16 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted, nextTick, watchEffect, watch } from 'vue'
-import { authState, logout } from '../auth'
-
-const ADMIN_EMAILS = [
-  'ponrajacc@gmail.com',
-  'gunatamil123@gmail.com',
-  'learning@faceprep.in'
-]
+import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { authState, logout, setUserSession } from '../auth'
+import {
+  isAdmin,
+  isTrainer,
+  isStudent,
+  hasMinRole,
+  getRoleWeight,
+  normalizeRole,
+  ROLE_LABELS,
+  ROLES
+} from '../roles'
 
 // ── Zoho OAuth configuration ─────────────────────────────────────────────────
 // The Client ID is public (safe to embed). Client Secret stays server-side.
@@ -15,16 +19,9 @@ const ZOHO_ACCOUNTS_DOMAIN = import.meta.env.VITE_ZOHO_ACCOUNTS_DOMAIN || 'https
 
 const isZohoLoading = ref(false)
 // Plain variable (NOT a ref) — storing a cross-origin Window in ref() causes a SecurityError
-// because Vue's reactivity tries to read properties from the popup after it navigates to Zoho
 let zohoPopupWindow = null
 
-const SUPER_ADMIN = 'ponrajacc@gmail.com'
-
 // Sync auth state with DOM body/html classes to hide/show slides securely.
-// Use watch() with flush:'post' so the DOM class update runs AFTER Slidev's
-// own watchers (including updateSharedState) have already initialised nav.current.
-// This prevents the "Cannot read properties of undefined (reading 'current')" error
-// that occurred when watchEffect fired synchronously during Slidev's bootstrap.
 watch(
   () => authState.isLoggedIn,
   (isLoggedIn) => {
@@ -53,6 +50,7 @@ const showFullscreenPrompt = ref(false)
 const errorMessage = ref('')
 const successMessage = ref('')
 const newEmail = ref('')
+const selectedRole = ref('student')
 const isLoading = ref(false)
 const isPageLoading = ref(true)
 const searchQuery = ref('')
@@ -65,25 +63,26 @@ const parsedEmailsPreview = computed(() => {
   return [...new Set(matches.map(e => e.trim().toLowerCase()))]
 })
 
-const filteredEmails = computed(() => {
-  const sorted = [...authState.allowedEmails].sort((a, b) => {
-    const aLower = a.toLowerCase()
-    const bLower = b.toLowerCase()
-    // Super admin always first
-    if (aLower === SUPER_ADMIN && bLower !== SUPER_ADMIN) return -1
-    if (bLower === SUPER_ADMIN && aLower !== SUPER_ADMIN) return 1
-    // Other admins before regular users
-    const aIsAdmin = ADMIN_EMAILS.includes(aLower)
-    const bIsAdmin = ADMIN_EMAILS.includes(bLower)
-    if (aIsAdmin && !bIsAdmin) return -1
-    if (!aIsAdmin && bIsAdmin) return 1
-    // Alphabetical within each group
-    return a.localeCompare(b)
+// Filtered and sorted users based on role priority (admin > trainer > student)
+const filteredUsers = computed(() => {
+  const users = [...(authState.registeredUsers || [])]
+  const sorted = users.sort((a, b) => {
+    // 1. Role hierarchy weight (higher weight first: admin 3, trainer 2, student 1)
+    const weightA = getRoleWeight(a.role)
+    const weightB = getRoleWeight(b.role)
+    if (weightA !== weightB) {
+      return weightB - weightA
+    }
+    // 2. Alphabetical within same role
+    return (a.email || '').localeCompare(b.email || '')
   })
 
   if (!searchQuery.value.trim()) return sorted
   const q = searchQuery.value.trim().toLowerCase()
-  return sorted.filter(e => e.toLowerCase().includes(q))
+  return sorted.filter(u =>
+    (u.email || '').toLowerCase().includes(q) ||
+    (u.role || '').toLowerCase().includes(q)
+  )
 })
 
 const isNotAllowed = ref(false)
@@ -111,8 +110,7 @@ function resetLogin() {
 
 /**
  * Build the Zoho authorization URL and open a popup window.
- * The popup will redirect to /zoho-callback.html, which posts the auth code
- * back via window.opener.postMessage.
+ * The popup redirects to /zoho-callback.html, which posts the auth code back.
  */
 function initiateZohoLogin() {
   errorMessage.value = ''
@@ -122,18 +120,10 @@ function initiateZohoLogin() {
     return
   }
 
-  // Build redirect URI dynamically so it works in both dev and production
   const redirectUri = `${window.location.origin}/zoho-callback.html`
-
-  // Random state param to prevent CSRF
   const state = Math.random().toString(36).substring(2, 15)
   sessionStorage.setItem('zoho_oauth_state', state)
 
-  // Build URL manually — URLSearchParams percent-encodes scope separators which Zoho rejects.
-  // Zoho only supports its own scope names; access_type and prompt are Google-specific and unsupported.
-  // AaaServer.profile.Read  → legacy /oauth/user/info endpoint (Email, Display_Name, ZUID…)
-  // openid email profile    → OIDC  /oauth/v2/userinfo endpoint (email, name, sub…)
-  // Request all so either endpoint path can return an email address.
   const scope = 'AaaServer.profile.Read openid email profile'
   const authUrl = `${ZOHO_ACCOUNTS_DOMAIN}/oauth/v2/auth` +
     `?response_type=code` +
@@ -142,13 +132,6 @@ function initiateZohoLogin() {
     `&redirect_uri=${encodeURIComponent(redirectUri)}` +
     `&state=${encodeURIComponent(state)}`
 
-  // Debug log — open browser DevTools Console to see this
-  console.log('[Zoho Auth] Client ID:', ZOHO_CLIENT_ID)
-  console.log('[Zoho Auth] Domain:', ZOHO_ACCOUNTS_DOMAIN)
-  console.log('[Zoho Auth] Redirect URI:', redirectUri)
-  console.log('[Zoho Auth] Full URL:', authUrl)
-
-  // Open a centred popup
   const width = 480
   const height = 600
   const left = Math.max(0, (window.screen.width - width) / 2)
@@ -168,7 +151,6 @@ function initiateZohoLogin() {
   zohoPopupWindow = popup
   isZohoLoading.value = true
 
-  // Poll for unexpected closure (user closes popup manually)
   const pollTimer = setInterval(() => {
     if (zohoPopupWindow && zohoPopupWindow.closed) {
       clearInterval(pollTimer)
@@ -180,11 +162,9 @@ function initiateZohoLogin() {
 
 /**
  * Handles the postMessage from zoho-callback.html.
- * Exchanges the auth code for user profile via the backend, then
- * runs the same whitelist check as the Google flow.
+ * Exchanges the auth code on the backend and retrieves verified Supabase role.
  */
 async function handleZohoMessage(event) {
-  // Only accept messages from our own origin
   if (event.origin !== window.location.origin) return
 
   const { type, code, state, error } = event.data || {}
@@ -197,7 +177,6 @@ async function handleZohoMessage(event) {
 
   if (type !== 'ZOHO_AUTH_CODE' || !code) return
 
-  // CSRF check
   const savedState = sessionStorage.getItem('zoho_oauth_state')
   sessionStorage.removeItem('zoho_oauth_state')
   if (state && savedState && state !== savedState) {
@@ -212,7 +191,6 @@ async function handleZohoMessage(event) {
   try {
     const redirectUri = `${window.location.origin}/zoho-callback.html`
 
-    // Exchange code on backend (client secret stays server-side)
     const response = await fetch('/api/zoho-auth', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -221,8 +199,10 @@ async function handleZohoMessage(event) {
 
     const data = await response.json()
 
-    if (!response.ok || data.error) {
-      errorMessage.value = data.error || 'Zoho authentication failed. Please try again.'
+    if (!response.ok || !data.allowed) {
+      isNotAllowed.value = true
+      notAllowedEmail.value = data.email || ''
+      errorMessage.value = data.error || 'Your Zoho account is not registered.'
       isZohoLoading.value = false
       return
     }
@@ -234,29 +214,18 @@ async function handleZohoMessage(event) {
       return
     }
 
-    // Re-fetch whitelist and check
-    await fetchWhitelistedEmails()
-    const isAllowed = authState.allowedEmails.map(e => e.toLowerCase()).includes(email)
+    // Set authenticated session with role from Supabase
+    setUserSession({
+      email,
+      name: data.name || email,
+      picture: data.picture || '',
+      idToken: `zoho:${code}`,
+      role: data.role,
+      provider: 'zoho'
+    })
 
-    if (isAllowed) {
-      authState.isLoggedIn = true
-      authState.userEmail = email
-      authState.userName = data.name || email
-      authState.userPicture = data.picture || ''
-      authState.idToken = `zoho:${code}` // placeholder — backend verified
-      authState.isAdmin = ADMIN_EMAILS.includes(email)
-
-      localStorage.setItem('fp_auth_token', `zoho:${code}`)
-      localStorage.setItem('fp_auth_email', email)
-      localStorage.setItem('fp_auth_name', data.name || email)
-      localStorage.setItem('fp_auth_picture', data.picture || '')
-      localStorage.setItem('fp_auth_provider', 'zoho')
-
-      showFullscreenPrompt.value = true
-    } else {
-      isNotAllowed.value = true
-      notAllowedEmail.value = email
-    }
+    await fetchRegisteredUsers()
+    showFullscreenPrompt.value = true
   } catch (err) {
     console.error('[Zoho auth] Exchange error:', err)
     errorMessage.value = 'Network error during Zoho sign-in. Please try again.'
@@ -288,25 +257,37 @@ function decodeJwt(token) {
   }
 }
 
-// Fetch whitelisted emails from API
-async function fetchWhitelistedEmails() {
+// Fetch registered users and roles from Supabase backend
+async function fetchRegisteredUsers() {
   try {
-    const response = await fetch('/api/emails')
+    const headers = {}
+    if (authState.idToken) {
+      headers['Authorization'] = `Bearer ${authState.idToken}`
+      headers['x-user-email'] = authState.userEmail
+    }
+
+    const response = await fetch('/api/emails', { headers })
     if (response.ok) {
       const data = await response.json()
       authState.allowedEmails = data.emails || []
+      authState.registeredUsers = data.users || (data.emails || []).map(e => ({
+        email: e,
+        role: 'student'
+      }))
       localStorage.setItem('fp_allowed_emails', JSON.stringify(authState.allowedEmails))
+      localStorage.setItem('fp_registered_users', JSON.stringify(authState.registeredUsers))
     } else {
       throw new Error('API response not ok')
     }
   } catch (error) {
-    console.warn('Could not fetch allowed emails from server. Falling back to local cache/default.', error)
-    const local = localStorage.getItem('fp_allowed_emails')
-    if (local) {
-      authState.allowedEmails = JSON.parse(local)
-    } else {
-      authState.allowedEmails = [...ADMIN_EMAILS]
-      localStorage.setItem('fp_allowed_emails', JSON.stringify(authState.allowedEmails))
+    console.warn('Could not fetch users from server. Falling back to local cache.', error)
+    const localEmails = localStorage.getItem('fp_allowed_emails')
+    const localUsers = localStorage.getItem('fp_registered_users')
+    if (localEmails) {
+      authState.allowedEmails = JSON.parse(localEmails)
+    }
+    if (localUsers) {
+      authState.registeredUsers = JSON.parse(localUsers)
     }
   }
 }
@@ -315,25 +296,33 @@ async function fetchWhitelistedEmails() {
 async function checkAuthSession() {
   checkIsAdminPage()
   isPageLoading.value = true
-  await fetchWhitelistedEmails()
+  await fetchRegisteredUsers()
 
   const savedToken = localStorage.getItem('fp_auth_token')
   const savedEmail = localStorage.getItem('fp_auth_email')
   const savedName = localStorage.getItem('fp_auth_name')
   const savedPicture = localStorage.getItem('fp_auth_picture')
+  const savedRole = localStorage.getItem('fp_auth_role')
+  const savedProvider = localStorage.getItem('fp_auth_provider')
 
   if (savedToken && savedEmail) {
-    const isAllowed = authState.allowedEmails.map(e => e.toLowerCase()).includes(savedEmail.toLowerCase())
-    if (isAllowed) {
-      authState.isLoggedIn = true
-      authState.userEmail = savedEmail
-      authState.userName = savedName || ''
-      authState.userPicture = savedPicture || ''
-      authState.idToken = savedToken
-      authState.isAdmin = ADMIN_EMAILS.includes(savedEmail.toLowerCase())
+    const cleanEmail = savedEmail.toLowerCase().trim()
+    const matchingUser = authState.registeredUsers.find(
+      u => (u.email || '').toLowerCase() === cleanEmail
+    )
+
+    if (matchingUser) {
+      setUserSession({
+        email: cleanEmail,
+        name: savedName || cleanEmail,
+        picture: savedPicture || '',
+        idToken: savedToken,
+        role: matchingUser.role || savedRole || 'student',
+        provider: savedProvider || 'google'
+      })
     } else {
       logout()
-      errorMessage.value = `Session expired: Email '${savedEmail}' is no longer whitelisted.`
+      errorMessage.value = `Session expired: Email '${savedEmail}' is no longer registered in the system.`
     }
   }
   isPageLoading.value = false
@@ -373,11 +362,11 @@ function initGoogleSignIn() {
   })
 }
 
-// Google Sign-In Callback
+// Google Sign-In Callback — verified against Supabase backend
 async function handleGoogleSignInCallback(response) {
   errorMessage.value = ''
   successMessage.value = ''
-  
+
   if (!response.credential) {
     errorMessage.value = 'Failed to retrieve login credentials from Google.'
     return
@@ -389,7 +378,7 @@ async function handleGoogleSignInCallback(response) {
     return
   }
 
-  const email = payload.email ? payload.email.toLowerCase() : ''
+  const email = payload.email ? payload.email.toLowerCase().trim() : ''
   const isEmailVerified = payload.email_verified === true || payload.email_verified === 'true'
 
   if (!email) {
@@ -402,30 +391,48 @@ async function handleGoogleSignInCallback(response) {
     return
   }
 
-  await fetchWhitelistedEmails()
+  try {
+    // 1. Verify token with backend against Supabase users store
+    const verifyRes = await fetch('/api/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'verify',
+        idToken: response.credential
+      })
+    })
 
-  const isAllowed = authState.allowedEmails.map(e => e.toLowerCase()).includes(email)
+    const verifyData = await verifyRes.json()
 
-  if (isAllowed) {
-    authState.isLoggedIn = true
-    authState.userEmail = email
-    authState.userName = payload.name || ''
-    authState.userPicture = payload.picture || ''
-    authState.idToken = response.credential
-    authState.isAdmin = ADMIN_EMAILS.includes(email)
+    if (!verifyRes.ok || !verifyData.allowed) {
+      isNotAllowed.value = true
+      notAllowedEmail.value = email
+      errorMessage.value = verifyData.error || `Email '${email}' is not registered in the system.`
+      return
+    }
 
-    localStorage.setItem('fp_auth_token', response.credential)
-    localStorage.setItem('fp_auth_email', email)
-    localStorage.setItem('fp_auth_name', payload.name || '')
-    localStorage.setItem('fp_auth_picture', payload.picture || '')
+    const dbUser = verifyData.user || {}
+    const role = dbUser.role || 'student'
+
+    // 2. Set user session with fresh database role
+    setUserSession({
+      email,
+      name: payload.name || '',
+      picture: payload.picture || '',
+      idToken: response.credential,
+      role,
+      provider: 'google'
+    })
+
+    await fetchRegisteredUsers()
     showFullscreenPrompt.value = true
-  } else {
-    isNotAllowed.value = true
-    notAllowedEmail.value = email
+  } catch (err) {
+    console.error('Google Sign-In verification error:', err)
+    errorMessage.value = 'Authentication verification error. Please try again.'
   }
 }
 
-// Add new email(s) (Admin only)
+// Add new email(s) with selected role (Admin only)
 async function addEmail() {
   const emailsToWhitelist = parsedEmailsPreview.value
   if (emailsToWhitelist.length === 0) return
@@ -439,43 +446,45 @@ async function addEmail() {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${authState.idToken}`
+        'Authorization': `Bearer ${authState.idToken}`,
+        'x-user-email': authState.userEmail
       },
-      body: JSON.stringify({ emails: emailsToWhitelist })
+      body: JSON.stringify({
+        emails: emailsToWhitelist,
+        role: selectedRole.value
+      })
     })
 
     const data = await response.json()
 
     if (response.ok) {
       authState.allowedEmails = data.emails || []
+      authState.registeredUsers = data.users || []
       localStorage.setItem('fp_allowed_emails', JSON.stringify(authState.allowedEmails))
-      successMessage.value = `Successfully added`
+      localStorage.setItem('fp_registered_users', JSON.stringify(authState.registeredUsers))
+      successMessage.value = `Successfully registered ${emailsToWhitelist.length} user(s) as ${ROLE_LABELS[selectedRole.value] || selectedRole.value}.`
       newEmail.value = ''
 
       setTimeout(() => {
         successMessage.value = ''
-      },1000)
+      }, 2500)
     } else {
-      throw new Error(data.error || 'Failed to add emails')
+      throw new Error(data.error || 'Failed to add users')
     }
   } catch (error) {
-    console.error('Failed to add emails: ', error)
-    errorMessage.value = error.message || 'Failed to add emails'
+    console.error('Failed to add users: ', error)
+    errorMessage.value = error.message || 'Failed to add users'
   } finally {
     isLoading.value = false
   }
 }
 
-// Delete email (Admin only)
+// Delete user (Admin only)
 async function removeEmail(emailToRemove) {
-  if (ADMIN_EMAILS.includes(emailToRemove)) {
-    errorMessage.value = 'Cannot remove the super administrator email.'
+  if (emailToRemove.toLowerCase() === authState.userEmail.toLowerCase()) {
+    errorMessage.value = 'You cannot remove your own administrator account.'
     return
   }
-
-  // if (!confirm(`Are you sure you want to remove '${emailToRemove}' from the whitelist?`)) {
-  //   return
-  // }
 
   errorMessage.value = ''
   successMessage.value = ''
@@ -486,7 +495,8 @@ async function removeEmail(emailToRemove) {
       method: 'DELETE',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${authState.idToken}`
+        'Authorization': `Bearer ${authState.idToken}`,
+        'x-user-email': authState.userEmail
       },
       body: JSON.stringify({ email: emailToRemove })
     })
@@ -495,18 +505,61 @@ async function removeEmail(emailToRemove) {
 
     if (response.ok) {
       authState.allowedEmails = data.emails || []
+      authState.registeredUsers = data.users || []
       localStorage.setItem('fp_allowed_emails', JSON.stringify(authState.allowedEmails))
-      successMessage.value = `Removed successfully`
+      localStorage.setItem('fp_registered_users', JSON.stringify(authState.registeredUsers))
+      successMessage.value = `Removed '${emailToRemove}' successfully`
 
       setTimeout(() => {
         successMessage.value = ''
-      },1000)
+      }, 2500)
     } else {
-      throw new Error(data.error || 'Failed to remove email')
+      throw new Error(data.error || 'Failed to remove user')
     }
   } catch (error) {
-    console.error('Failed to remove email:', error)
-    errorMessage.value = error.message || 'Failed to remove email'
+    console.error('Failed to remove user:', error)
+    errorMessage.value = error.message || 'Failed to remove user'
+  } finally {
+    isLoading.value = false
+  }
+}
+
+// Update user role (Admin only)
+async function changeRole(userEmail, newRole) {
+  errorMessage.value = ''
+  successMessage.value = ''
+  isLoading.value = true
+
+  try {
+    const response = await fetch('/api/emails', {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${authState.idToken}`,
+        'x-user-email': authState.userEmail
+      },
+      body: JSON.stringify({
+        email: userEmail,
+        role: newRole
+      })
+    })
+
+    const data = await response.json()
+
+    if (response.ok) {
+      authState.registeredUsers = data.users || []
+      localStorage.setItem('fp_registered_users', JSON.stringify(authState.registeredUsers))
+      successMessage.value = `Updated role for '${userEmail}' to ${ROLE_LABELS[newRole] || newRole}.`
+
+      setTimeout(() => {
+        successMessage.value = ''
+      }, 2500)
+    } else {
+      throw new Error(data.error || 'Failed to update user role')
+    }
+  } catch (error) {
+    console.error('Failed to update role:', error)
+    errorMessage.value = error.message || 'Failed to update role'
   } finally {
     isLoading.value = false
   }
@@ -517,7 +570,7 @@ function blockKeyboard(e) {
   if (!authState.isLoggedIn) {
     const blockedKeys = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'PageUp', 'PageDown', 'Home', 'End', ' ', 'Spacebar', 'Enter']
     if (blockedKeys.includes(e.key)) {
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') {
         return
       }
       e.preventDefault()
@@ -534,9 +587,6 @@ onMounted(() => {
   // Listen for Zoho popup postMessage
   window.addEventListener('message', handleZohoMessage)
 
-  // Defer auth session check to nextTick so Slidev's navigation context
-  // (nav.current used by updateSharedState in root.ts) is fully initialised
-  // before any authState mutations trigger Slidev's internal shared-state watchers.
   nextTick(() => {
     checkAuthSession().then(() => {
       if (typeof window.google === 'undefined') {
@@ -562,7 +612,6 @@ onUnmounted(() => {
   window.removeEventListener('keypress', blockKeyboard, { capture: true })
   window.removeEventListener('message', handleZohoMessage)
 
-  // Close any open Zoho popup when component unmounts
   if (zohoPopupWindow && !zohoPopupWindow.closed) {
     zohoPopupWindow.close()
     zohoPopupWindow = null
@@ -572,7 +621,7 @@ onUnmounted(() => {
 
 <template>
   <div>
-    <!-- FULLSCREEN PROMPT (shown once after login, requires direct click for browser gesture) -->
+    <!-- FULLSCREEN PROMPT -->
     <Transition name="fade">
       <div v-if="showFullscreenPrompt" class="fs-prompt-overlay">
         <div class="fs-prompt-card">
@@ -597,10 +646,8 @@ onUnmounted(() => {
             <div class="brand-logo">
               <img src="../assets/logo.png" style="width: 150px;"/>
             </div>
-            <p class="brand-tagline">{{ isAdminPage ? 'Admin Whitelist Portal' : 'Interactive Slide Deck Portal' }}</p>
+            <p class="brand-tagline">{{ isAdminPage ? 'Admin User Management' : 'Interactive Slide Deck Portal' }}</p>
           </div>
-
-          <!-- <div class="divider"></div> -->
 
           <!-- Card Body -->
           <div class="login-body">
@@ -612,10 +659,11 @@ onUnmounted(() => {
                   <line x1="9" y1="9" x2="15" y2="15"/>
                 </svg>
               </div>
-              
-              <h2 class="login-heading text-red">Not allowed</h2>
+
+              <h2 class="login-heading text-red">Access Denied</h2>
               <p class="login-subtext text-center">
-                This email is not whitelisted to access.
+                {{ notAllowedEmail ? `'${notAllowedEmail}' is not registered.` : 'This email is not registered in the system.' }}
+                Please contact your course administrator.
               </p>
               <div class="not-allowed-actions" style="text-align: center;">
                 <button @click="resetLogin" class="action-btn-retry">Go Back</button>
@@ -626,10 +674,10 @@ onUnmounted(() => {
               <h2 class="login-heading">{{ isAdminPage ? 'Admin Sign In' : 'Sign In Required' }}</h2>
               <p class="login-subtext">
                 {{ isAdminPage 
-                  ? 'Sign in to the Whitelist Management portal using an administrator Google account.' 
-                  : 'Access to this interactive slide deck is restricted. Please sign in with a whitelisted Google Account.' }}
+                  ? 'Sign in with an authorized Google or Zoho administrator account.' 
+                  : 'Access to this course is restricted. Please sign in with your registered account.' }}
               </p>
-              
+
               <!-- Sign-in buttons -->
               <div class="signin-buttons-stack">
                 <!-- Google Button -->
@@ -655,7 +703,6 @@ onUnmounted(() => {
                   >
                     <span v-if="isZohoLoading" class="zoho-btn-spinner"></span>
                     <template v-else>
-                      <!-- Zoho Z icon -->
                       <svg class="zoho-btn-icon" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
                         <rect width="36" height="36" rx="6" fill="#E42527"/>
                         <path d="M9 10h18v3.5L15.5 26H27v3H9v-3.5L20.5 13H9V10z" fill="white"/>
@@ -686,7 +733,7 @@ onUnmounted(() => {
     <!-- Page Loading Indicator -->
     <div v-if="isPageLoading" class="page-loader-overlay">
       <div class="loader-spinner"></div>
-      <p class="loader-text">Loading deck authorization...</p>
+      <p class="loader-text">Loading authorization...</p>
     </div>
 
     <!-- 2. ADMIN DASHBOARD MODAL/PAGE -->
@@ -700,7 +747,7 @@ onUnmounted(() => {
                 <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.1a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/>
                 <circle cx="12" cy="12" r="3"/>
               </svg>
-              <p>Manage Emails</p>
+              <p>User & Role Management (Supabase RBAC)</p>
             </div>
             <button class="close-btn" @click="closeAdminPanel" :title="isAdminPage ? 'Back to Slides' : 'Close'">
               <svg v-if="isAdminPage" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 20px; height: 20px;">
@@ -728,36 +775,37 @@ onUnmounted(() => {
               <span>{{ successMessage }}</span>
             </div>
 
-            <!-- Add Email Form -->
+            <!-- Add Email / User Form -->
             <form @submit.prevent="addEmail" class="add-form">
               <textarea 
                 v-model="newEmail" 
-                placeholder="Add Email Address" 
+                placeholder="Add Email Address(es)" 
                 required 
                 class="form-input form-textarea"
-                rows="3"
+                rows="2"
                 :disabled="isLoading"
               ></textarea>
 
-              <!-- Live Auto-Separated Emails Preview -->
-              <!-- <div v-if="parsedEmailsPreview.length > 0" class="parsed-preview-box">
-                <span class="preview-title">Detected {{ parsedEmailsPreview.length }} email(s):</span>
-                <div class="preview-tags">
-                  <span v-for="email in parsedEmailsPreview" :key="email" class="preview-tag">
-                    {{ email }}
-                  </span>
+              <div class="form-row-actions">
+                <div class="role-selector-wrap">
+                  <label class="role-label">Assign Role:</label>
+                  <select v-model="selectedRole" class="role-select" :disabled="isLoading">
+                    <option value="student">Student (Standard)</option>
+                    <option value="trainer">Trainer (Elevated)</option>
+                    <option value="admin">Admin (Full Control)</option>
+                  </select>
                 </div>
-              </div> -->
 
-              <button type="submit" class="submit-btn" :disabled="isLoading || parsedEmailsPreview.length === 0">
-                <span v-if="isLoading" class="btn-spinner"></span>
-                <span v-else>Add {{ parsedEmailsPreview.length == 0 ? "" : parsedEmailsPreview.length }} Email{{ parsedEmailsPreview.length == 1 ? "" : "(s)" }}</span>
-              </button>
+                <button type="submit" class="submit-btn" :disabled="isLoading || parsedEmailsPreview.length === 0">
+                  <span v-if="isLoading" class="btn-spinner"></span>
+                  <span v-else>Register {{ parsedEmailsPreview.length == 0 ? "" : parsedEmailsPreview.length }} User{{ parsedEmailsPreview.length == 1 ? "" : "(s)" }}</span>
+                </button>
+              </div>
             </form>
 
             <!-- Whitelisted Heading with Search -->
             <div class="whitelisted-heading">
-              <span>Registered Emails ({{ authState.allowedEmails.length }})</span>
+              <span>Registered Users ({{ authState.registeredUsers.length }})</span>
               <div class="search-wrapper">
                 <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <circle cx="11" cy="11" r="8"/>
@@ -766,7 +814,7 @@ onUnmounted(() => {
                 <input
                   v-model="searchQuery"
                   type="text"
-                  placeholder="Search"
+                  placeholder="Search email or role"
                   class="search-input"
                 />
                 <button v-if="searchQuery" class="search-clear-btn" @click="searchQuery = ''" title="Clear search">
@@ -778,32 +826,56 @@ onUnmounted(() => {
               </div>
             </div>
 
-            <!-- Whitelist List -->
+            <!-- Users List -->
             <div class="emails-list-container">
-              <div v-if="filteredEmails.length === 0" class="no-emails">
-                {{ searchQuery ? `No emails match "${searchQuery}"` : 'No emails found.' }}
+              <div v-if="filteredUsers.length === 0" class="no-emails">
+                {{ searchQuery ? `No users match "${searchQuery}"` : 'No registered users found.' }}
               </div>
               <ul v-else class="emails-list">
-                <li v-for="email in filteredEmails" :key="email" class="email-item">
+                <li v-for="user in filteredUsers" :key="user.email" class="email-item">
                   <div class="email-details">
-                    <span class="email-text">{{ email }}</span>
-                    <span v-if="email === SUPER_ADMIN" class="badge-admin">Admin</span>
-                    <span v-else-if="ADMIN_EMAILS.includes(email)" class="badge-admin">Admin</span>
+                    <span class="email-text">{{ user.email }}</span>
+                    <span
+                      class="role-badge"
+                      :class="{
+                        'badge-admin': user.role === 'admin',
+                        'badge-trainer': user.role === 'trainer',
+                        'badge-student': user.role === 'student' || !user.role
+                      }"
+                    >
+                      {{ ROLE_LABELS[user.role] || user.role }}
+                    </span>
                   </div>
-                  <button 
-                    v-if="!ADMIN_EMAILS.includes(email)"
-                    @click="removeEmail(email)" 
-                    class="delete-btn" 
-                    title="Remove access"
-                    :disabled="isLoading"
-                  >
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="trash-icon">
-                      <polyline points="3 6 5 6 21 6"/>
-                      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-                      <line x1="10" y1="11" x2="10" y2="17"/>
-                      <line x1="14" y1="11" x2="14" y2="17"/>
-                    </svg>
-                  </button>
+
+                  <div class="user-item-actions">
+                    <!-- Quick Role Switcher -->
+                    <select
+                      :value="user.role || 'student'"
+                      @change="changeRole(user.email, $event.target.value)"
+                      class="role-switch-select"
+                      :disabled="isLoading || user.email.toLowerCase() === authState.userEmail.toLowerCase()"
+                      title="Change user role"
+                    >
+                      <option value="admin">Admin</option>
+                      <option value="trainer">Trainer</option>
+                      <option value="student">Student</option>
+                    </select>
+
+                    <button 
+                      v-if="user.email.toLowerCase() !== authState.userEmail.toLowerCase()"
+                      @click="removeEmail(user.email)" 
+                      class="delete-btn" 
+                      title="Remove access"
+                      :disabled="isLoading"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="trash-icon">
+                        <polyline points="3 6 5 6 21 6"/>
+                        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                        <line x1="10" y1="11" x2="10" y2="17"/>
+                        <line x1="14" y1="11" x2="14" y2="17"/>
+                      </svg>
+                    </button>
+                  </div>
                 </li>
               </ul>
             </div>
@@ -822,7 +894,6 @@ onUnmounted(() => {
             </div>
             <p class="brand-tagline">Admin Portal</p>
           </div>
-          <!-- <div class="divider"></div> -->
           <div class="login-body">
             <div class="not-allowed-icon-container text-red">
               <svg class="not-allowed-large-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -831,7 +902,9 @@ onUnmounted(() => {
               </svg>
             </div>
             <h2 class="login-heading text-red">Access Denied</h2>
-            <p class="login-subtext text-center">Administrator privileges are required to access this portal. Currently signed in as <strong>{{ authState.userEmail }}</strong>.</p>
+            <p class="login-subtext text-center">
+              Administrator privileges required. Currently signed in as <strong>{{ authState.userEmail }}</strong> (Role: {{ ROLE_LABELS[authState.role] || authState.role }}).
+            </p>
             <div class="not-allowed-actions">
               <button @click="logout" class="action-btn-retry width-full">Sign Out / Switch Account</button>
               <a href="/" class="action-btn-admin width-full text-center">Back to Slides</a>
@@ -861,7 +934,6 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
-  margin-top: 1.5rem;
   margin-top: -10px;
 }
 
@@ -884,7 +956,6 @@ onUnmounted(() => {
 
 .action-btn-retry {
   background: #ffffff;
-  /* color: #ffffffd3 !important; */
   font-weight: 500;
   font-size: 0.88rem;
   padding: 5px;
@@ -894,7 +965,7 @@ onUnmounted(() => {
   cursor: pointer;
   box-sizing: border-box;
   color: #475569;
-  width:100px;
+  width: 100px;
 }
 
 /* Fullscreen Prompt */
@@ -902,7 +973,7 @@ onUnmounted(() => {
   position: fixed;
   inset: 0;
   width: 100%;
-  height: 100vh;
+  height: 100%;
   background: rgba(241, 245, 249, 0.8);
   display: flex;
   justify-content: center;
@@ -961,16 +1032,14 @@ onUnmounted(() => {
 .login-overlay {
   position: fixed;
   inset: 0;
-  width: 100vw;
-  height: 100vh;
+  width: 100%;
+  height: 100%;
   display: flex;
   justify-content: right;
   align-items: center;
   z-index: 10;
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
   overflow: hidden;
-  width: 100%;
-  height: 100%;
   background-position: center center;
   background-image: url("../assets/Header_Student_placement.webp");
   background-size: 500px;
@@ -1041,11 +1110,6 @@ onUnmounted(() => {
   margin-bottom: 0.5rem;
 }
 .brand-tagline { color: #383838; font-size: 0.85rem; margin: 0.25rem 0 0 0; }
-
-.divider {
-  height: 1px;
-  background: linear-gradient(90deg, rgba(0,0,0,0), rgba(0,0,0,0.06), rgba(0,0,0,0));
-}
 
 .login-heading {
   color: #1e293b;
@@ -1120,24 +1184,10 @@ onUnmounted(() => {
   border-color: #c5c7ca;
   box-shadow: 0 2px 6px rgba(60,64,67,.12);
 }
-.zoho-btn:active:not(:disabled) {
-  background: #f1f3f4;
-}
-.zoho-btn:disabled {
-  opacity: 0.75;
-  cursor: not-allowed;
-}
-.zoho-btn-icon {
-  width: 18px;
-  height: 18px;
-  flex-shrink: 0;
-  border-radius: 3px;
-}
-.zoho-btn-text {
-  flex: 1;
-  text-align: center;
-  padding-right: 18px; /* visually balance the icon */
-}
+.zoho-btn:active:not(:disabled) { background: #f1f3f4; }
+.zoho-btn:disabled { opacity: 0.75; cursor: not-allowed; }
+.zoho-btn-icon { width: 18px; height: 18px; flex-shrink: 0; border-radius: 3px; }
+.zoho-btn-text { flex: 1; text-align: center; padding-right: 18px; }
 .zoho-btn-spinner {
   width: 18px;
   height: 18px;
@@ -1178,34 +1228,31 @@ onUnmounted(() => {
 
 .admin-card {
   width: 100%;
-  max-width: 500px;
+  max-width: 540px;
   background: #ffffff;
   border: 1px solid #e2e8f0;
-  border-radius: 8px;
-  box-shadow: 0 20px 40px -15px rgba(15, 23, 42, 0.1);
+  border-radius: 10px;
+  box-shadow: 0 20px 40px -15px rgba(15, 23, 42, 0.12);
   display: flex;
   flex-direction: column;
-  min-height: 10vh;
   box-sizing: border-box;
-  /* margin-top: -200px; */
 }
 
 .admin-header {
-  padding: 1rem 1rem;
+  padding: 0.85rem 1rem;
   border-bottom: 1px solid #e2e8f0;
   display: flex;
   justify-content: space-between;
   align-items: center;
-  height: 44px;
 }
 .admin-header-title { display: flex; align-items: center; gap: 0.5rem; }
 .admin-header-title p { 
-  color: #2c3543; 
-  font-size: .8rem; 
-  font-weight: 400; 
+  color: #1e293b; 
+  font-size: 0.85rem; 
+  font-weight: 600; 
   margin: 0; 
 }
-.admin-icon { width: 15px; height: 15px; color: #2c3543; }
+.admin-icon { width: 16px; height: 16px; color: #ef5050; }
 
 .close-btn {
   background: none;
@@ -1223,67 +1270,72 @@ onUnmounted(() => {
   background: #ef50503a; 
   color: #ef5050; 
 }
-.close-btn svg { width: 15px; height: 15px; }
+.close-btn svg { width: 16px; height: 16px; }
 
 .admin-body {
-  padding: 10px;
+  padding: 14px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
+  gap: 0.75rem;
 }
 
 .success-banner {
-  background: rgba(34, 197, 94, 0.05);
-  border: 1px solid rgba(34, 197, 94, 0.15);
+  background: rgba(34, 197, 94, 0.08);
+  border: 1px solid rgba(34, 197, 94, 0.2);
   border-radius: 8px;
-  padding: 5px 10px;
+  padding: 6px 10px;
   display: flex;
-  gap: 0.75rem;
+  gap: 0.5rem;
   align-items: center;
   color: #166534;
-  font-size: 0.65rem;
-  z-index: 20;
-
+  font-size: 0.75rem;
 }
-.success-icon { width: 13px; height: 13px; color: #22c55e; flex-shrink: 0; }
-.mb-3 { margin-bottom: 0.75rem; }
+.success-icon { width: 14px; height: 14px; color: #22c55e; flex-shrink: 0; }
+.mb-3 { margin-bottom: 0.5rem; }
 
-/* Add Email Form */
-.add-form { display: flex; flex-direction: column; gap: .5rem; }
-.form-textarea { min-height: 30px; resize: vertical; font-family: inherit; line-height: 1.4; }
+/* Add User Form */
+.add-form { display: flex; flex-direction: column; gap: 0.5rem; }
+.form-textarea { min-height: 48px; resize: vertical; font-family: inherit; line-height: 1.4; }
 
-.parsed-preview-box {
+.form-row-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.role-selector-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.role-label {
+  font-size: 0.72rem;
+  color: #64748b;
+  font-weight: 500;
+}
+.role-select {
   background: #f8fafc;
-  border: 1px dashed #cbd5e1;
-  border-radius: 8px;
-  padding: 5px;
-  max-height: 50px;
-  overflow-y: auto;
-}
-.preview-title { display: block; font-size: 0.6rem; font-weight: 500; color: #475569; margin-bottom: 0.2rem; text-align: left; }
-.preview-tags { display: flex; flex-wrap: wrap; gap: 0.375rem; }
-.preview-tag {
-  background: #e2e8f0;
-  color: #334155;
-  font-size: 0.6rem;
-  padding: 0.15rem 0.5rem;
-  border-radius: 4px;
   border: 1px solid #cbd5e1;
-  word-break: break-all;
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 0.72rem;
+  color: #1e293b;
+  outline: none;
+  cursor: pointer;
 }
+.role-select:focus { border-color: #ef5050; }
 
 .form-input {
-  flex: 1;
-  background: #b6b6b620;
-  border: 1px solid #383838a1;
-  border-radius: 4px;
-  padding: 8px;
+  background: #f8fafc;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 8px 10px;
   color: #1e293b;
-  font-size: 0.7rem;
+  font-size: 0.75rem;
   outline: none;
   transition: border-color 0.2s ease;
-
-  max-height: 50px;
 }
 .form-input:focus { border-color: #ef5050; }
 
@@ -1291,23 +1343,23 @@ onUnmounted(() => {
   background: #ef5050;
   color: white;
   border: none;
-  border-radius: 5px;
-  padding: 4px 6px;
+  border-radius: 6px;
+  padding: 6px 14px;
   font-weight: 600;
-  font-size: 0.6rem;
+  font-size: 0.72rem;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 20%;
   transition: background 0.2s ease;
+  white-space: nowrap;
 }
 .submit-btn:hover:not(:disabled) { background: #db3b3b; }
 .submit-btn:disabled { opacity: 0.6; cursor: not-allowed; }
 
 .btn-spinner {
-  width: 16px;
-  height: 16px;
+  width: 14px;
+  height: 14px;
   border: 2px solid rgba(255,255,255,0.3);
   border-left-color: white;
   border-radius: 50%;
@@ -1319,11 +1371,11 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-size: 0.6rem;
+  font-size: 0.7rem;
   color: #64748b;
-  letter-spacing: 0.05em;
-  font-weight: 500;
-  margin: 5px 0px;
+  letter-spacing: 0.03em;
+  font-weight: 600;
+  margin-top: 4px;
 }
 
 .search-wrapper {
@@ -1331,30 +1383,26 @@ onUnmounted(() => {
   flex-direction: row;
   align-items: center;
   background: #f8fafc;
-  /* background-color: palevioletred; */
   border: 1px solid #e2e8f0;
-  border-radius: 5px;
+  border-radius: 6px;
   padding: 3px 8px;
   gap: 4px;
   transition: border-color 0.2s ease;
-  width: 200px;
+  width: 180px;
 }
-.search-wrapper:focus-within { border-color: #ef5050; background: #fff; font-size: .5rem;}
-
-.search-icon { width: 11px; height: 11px; color: #94a3b8; flex-shrink: 0; }
-
+.search-wrapper:focus-within { border-color: #ef5050; background: #fff; }
+.search-icon { width: 12px; height: 12px; color: #94a3b8; flex-shrink: 0; }
 .search-input {
   border: none;
   outline: none;
   background: transparent;
-  font-size: 0.6rem;
-  color: #2a2a2b;
-  width: 150px;
+  font-size: 0.68rem;
+  color: #1e293b;
+  width: 100%;
   padding: 1px 0;
   font-family: inherit;
 }
 .search-input::placeholder { color: #94a3b8; }
-
 .search-clear-btn {
   background: none;
   border: none;
@@ -1364,62 +1412,97 @@ onUnmounted(() => {
   align-items: center;
   color: #94a3b8;
   transition: color 0.2s ease;
-  flex-shrink: 0;
 }
 .search-clear-btn:hover { color: #ef4444; }
 .search-clear-btn svg { width: 10px; height: 10px; }
 
-/* Email List */
+/* Email/User List */
 .emails-list-container {
-  max-height: 100px;
+  max-height: 180px;
   overflow-y: auto;
   border: 1px solid #e2e8f0;
-  border-radius: 4px;
+  border-radius: 6px;
   background: #f8fafc;
 }
-.no-emails { padding: 2rem; text-align: center; color: #64748b; font-size: 0.7rem; }
+.no-emails { padding: 1.5rem; text-align: center; color: #64748b; font-size: 0.75rem; }
 .emails-list { list-style: none; padding: 0; margin: 0; }
 
 .email-item {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 5px;
+  padding: 6px 10px;
   border-bottom: 1px solid #e2e8f0;
   transition: background 0.15s ease;
 }
 .email-item:last-child { border-bottom: none; }
 .email-item:hover { background: #f1f5f9; }
 
-.email-details { display: flex; align-items: center; gap: 0.75rem; }
-.email-text { color: #334155; font-size: 0.7rem; }
+.email-details { display: flex; align-items: center; gap: 0.5rem; }
+.email-text { color: #1e293b; font-size: 0.74rem; font-weight: 500; }
+
+.role-badge {
+  font-size: 0.62rem;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 12px;
+  text-transform: capitalize;
+}
 
 .badge-admin {
-  background: rgba(239, 80, 80, 0.1);
-  color: #ef5050;
-  font-size: 0.6rem;
-  font-weight: 300;
-  padding: 2px 8px;
-  border: 1px solid rgba(239, 80, 80, 0.2);
-  border-radius: 10px;
+  background: rgba(239, 68, 68, 0.1);
+  color: #ef4444;
+  border: 1px solid rgba(239, 68, 68, 0.25);
+}
+
+.badge-trainer {
+  background: rgba(14, 165, 233, 0.1);
+  color: #0284c7;
+  border: 1px solid rgba(14, 165, 233, 0.25);
+}
+
+.badge-student {
+  background: rgba(100, 116, 139, 0.1);
+  color: #64748b;
+  border: 1px solid rgba(100, 116, 139, 0.2);
+}
+
+.user-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.role-switch-select {
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  padding: 2px 4px;
+  font-size: 0.65rem;
+  color: #334155;
+  outline: none;
+  cursor: pointer;
+}
+.role-switch-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .delete-btn {
   background: none;
   border: none;
-  color: #64748b;
+  color: #94a3b8;
   cursor: pointer;
-  padding: 5px;
-  border-radius: 6px;
+  padding: 4px;
+  border-radius: 4px;
   display: flex;
   align-items: center;
   justify-content: center;
   transition: all 0.2s ease;
-  width: 23px;
 }
-.delete-btn:hover:not(:disabled) { background: rgba(239, 68, 68, 0.05); color: #ef4444; }
-.delete-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-.trash-icon { width: 16px; height: 16px; }
+.delete-btn:hover:not(:disabled) { background: rgba(239, 68, 68, 0.1); color: #ef4444; }
+.delete-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.trash-icon { width: 14px; height: 14px; }
 
 /* Animations */
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -1429,4 +1512,6 @@ onUnmounted(() => {
 
 .slide-up-enter-active { transition: all 0.3s ease-out; }
 .slide-up-enter-from { opacity: 0; transform: translateY(10px); }
+
+.login-body {display: flex; flex-direction: column; justify-content: center; align-items: center;}
 </style>
